@@ -13,5 +13,14 @@
 #        Default:     0 - Disabled
 #                     1 - Enabled
 #
+#    ReagentBank.CraftFromBank
+#        Description: When a trade skill cast is short on reagents, pull the
+#                     shortfall out of the account's reagent bank into the bags
+#                     automatically. The client cannot see the bank, so the
+#                     recipe still shows as red; the craft works anyway.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
 
 ReagentBank.Enable = 1
+ReagentBank.CraftFromBank = 1

@@ -3,6 +3,8 @@
  */
 
 #include "ReagentBank.h"
+#include "Spell.h"
+#include <algorithm>
 
 // Add player scripts
 class npc_reagent_banker : public CreatureScript
@@ -44,9 +46,12 @@ private:
 
     void WithdrawItem(Player* player, uint32 entry)
     {
+        // account-wide bank: the account id is the key, so every character on the
+        // account shares the storage. character_id is gone on purpose.
+        uint32 accountId = player->GetSession()->GetAccountId();
         // This query can be changed to async to improve performance, but there will be some visual bugs because the query will not be done executing when the menu refreshes
-        std::string query = "SELECT amount FROM custom_reagent_bank WHERE character_id = " + std::to_string(player->GetGUID().GetCounter()) + " AND item_entry = " + std::to_string(entry);
-        QueryResult result = CharacterDatabase.Query("SELECT amount FROM custom_reagent_bank WHERE character_id = " + std::to_string(player->GetGUID().GetCounter()) + " AND item_entry = " + std::to_string(entry));
+        std::string query = "SELECT amount FROM custom_reagent_bank WHERE account_id = " + std::to_string(accountId) + " AND item_entry = " + std::to_string(entry);
+        QueryResult result = CharacterDatabase.Query("SELECT amount FROM custom_reagent_bank WHERE account_id = " + std::to_string(accountId) + " AND item_entry = " + std::to_string(entry));
         if (result)
         {
             uint32 storedAmount = (*result)[0].Get<uint32>();
@@ -59,7 +64,7 @@ private:
                 InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, storedAmount);
                 if (msg == EQUIP_ERR_OK)
                 {
-                    CharacterDatabase.Execute("DELETE FROM custom_reagent_bank WHERE character_id = {} AND item_entry = {}", player->GetGUID().GetCounter(), entry);
+                    CharacterDatabase.Execute("DELETE FROM custom_reagent_bank WHERE account_id = {} AND item_entry = {}", accountId, entry);
                     Item* item = player->StoreNewItem(dest, entry, true);
                     player->SendNewItem(item, storedAmount, true, false);
                 }
@@ -76,7 +81,7 @@ private:
                 InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, stackSize);
                 if (msg == EQUIP_ERR_OK)
                 {
-                    CharacterDatabase.Execute("UPDATE custom_reagent_bank SET amount = {} WHERE character_id = {} AND item_entry = {}", storedAmount - stackSize, player->GetGUID().GetCounter(), entry);
+                    CharacterDatabase.Execute("UPDATE custom_reagent_bank SET amount = {} WHERE account_id = {} AND item_entry = {}", storedAmount - stackSize, accountId, entry);
                     Item* item = player->StoreNewItem(dest, entry, true);
                     player->SendNewItem(item, stackSize, true, false);
                 }
@@ -121,7 +126,8 @@ private:
 
     void DepositAllReagents(Player* player) {
         WorldSession *session = player->GetSession();
-        std::string query = "SELECT item_entry, item_subclass, amount FROM custom_reagent_bank WHERE character_id = " + std::to_string(player->GetGUID().GetCounter());
+        uint32 accountId = session->GetAccountId();
+        std::string query = "SELECT item_entry, item_subclass, amount FROM custom_reagent_bank WHERE account_id = " + std::to_string(accountId);
         session->GetQueryProcessor().AddCallback( CharacterDatabase.AsyncQuery(query).WithCallback([=, this](QueryResult result) {
             std::map<uint32, uint32> entryToAmountMap;
             std::map<uint32, uint32> entryToSubclassMap;
@@ -165,7 +171,7 @@ private:
                     uint32 itemEntry = mapEntry.first;
                     uint32 itemAmount = mapEntry.second;
                     uint32 itemSubclass = entryToSubclassMap.find(itemEntry)->second;
-                    trans->Append("REPLACE INTO custom_reagent_bank (character_id, item_entry, item_subclass, amount) VALUES ({}, {}, {}, {})", player->GetGUID().GetCounter(), itemEntry, itemSubclass, itemAmount);
+                    trans->Append("REPLACE INTO custom_reagent_bank (account_id, item_entry, item_subclass, amount) VALUES ({}, {}, {}, {})", accountId, itemEntry, itemSubclass, itemAmount);
                 }
                 CharacterDatabase.CommitTransaction(trans);
             }
@@ -239,7 +245,7 @@ public:
     void ShowReagentItems(Player* player, Creature* creature, uint32 item_subclass, uint16 gossipPageNumber)
     {
         WorldSession* session = player->GetSession();
-        std::string query = "SELECT item_entry, amount FROM custom_reagent_bank WHERE character_id = " + std::to_string(player->GetGUID().GetCounter()) + " AND item_subclass = " +
+        std::string query = "SELECT item_entry, amount FROM custom_reagent_bank WHERE account_id = " + std::to_string(session->GetAccountId()) + " AND item_subclass = " +
                 std::to_string(item_subclass) + " ORDER BY item_entry";
         session->GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(query).WithCallback([=, this](QueryResult result)
         {
@@ -278,8 +284,81 @@ public:
     }
 };
 
+// craft from bank: a trade skill cast whose reagents are sitting in the account
+// bank would fail the core's reagent check. this hook runs inside CheckCast,
+// BEFORE CheckItems, and pulls the shortfall out of custom_reagent_bank into the
+// bags so the normal cast consumes it. the client cannot see the bank, so the
+// recipe still looks red - the craft just works. kill switch in the conf.
+class ReagentBank_CraftFromBank : public AllSpellScript
+{
+public:
+    ReagentBank_CraftFromBank() : AllSpellScript("ReagentBank_CraftFromBank", { ALLSPELLHOOK_ON_SPELL_CHECK_CAST })
+    {
+        _enabled = sConfigMgr->GetOption<bool>("ReagentBank.CraftFromBank", true);
+    }
+
+    void OnSpellCheckCast(Spell* spell, bool /*strict*/, SpellCastResult& /*res*/) override
+    {
+        if (!_enabled || !spell)
+            return;
+
+        SpellInfo const* spellInfo = spell->GetSpellInfo();
+        if (!spellInfo || !spellInfo->HasAttribute(SPELL_ATTR0_IS_TRADESKILL))
+            return;
+
+        Unit* caster = spell->GetCaster();
+        Player* player = caster ? caster->ToPlayer() : nullptr;
+        if (!player || player->GetSession()->IsBot())
+            return;
+
+        uint32 accountId = player->GetSession()->GetAccountId();
+
+        for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+        {
+            int32 itemId = spellInfo->Reagent[i];
+            if (itemId <= 0)
+                continue;
+
+            uint32 required = spellInfo->ReagentCount[i];
+            uint32 have = player->GetItemCount(itemId);
+            if (have >= required)
+                continue;
+
+            uint32 missing = required - have;
+
+            QueryResult result = CharacterDatabase.Query("SELECT amount FROM custom_reagent_bank WHERE account_id = {} AND item_entry = {}", accountId, itemId);
+            if (!result)
+                continue;
+
+            uint32 stored = (*result)[0].Get<uint32>();
+            if (!stored)
+                continue;
+
+            uint32 take = std::min(missing, stored);
+
+            ItemPosCountVec dest;
+            if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, take) != EQUIP_ERR_OK)
+                continue;
+
+            // sync on purpose: an async write would let a second craft read the
+            // old amount and pull the same items twice.
+            if (take >= stored)
+                CharacterDatabase.Query("DELETE FROM custom_reagent_bank WHERE account_id = {} AND item_entry = {}", accountId, itemId);
+            else
+                CharacterDatabase.Query("UPDATE custom_reagent_bank SET amount = amount - {} WHERE account_id = {} AND item_entry = {}", take, accountId, itemId);
+
+            if (Item* item = player->StoreNewItem(dest, itemId, true))
+                player->SendNewItem(item, take, true, false);
+        }
+    }
+
+private:
+    bool _enabled = true;
+};
+
 // Add all scripts in one
 void AddSC_mod_reagent_bank()
 {
     new npc_reagent_banker();
+    new ReagentBank_CraftFromBank();
 }
