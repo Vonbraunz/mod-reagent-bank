@@ -306,7 +306,8 @@ public:
         if (!spellInfo || !spellInfo->HasAttribute(SPELL_ATTR0_IS_TRADESKILL))
             return;
 
-        Unit* caster = spell->GetCaster();
+        // GetCaster() returns WorldObject* since the core refactor; ToPlayer() works on it
+        WorldObject* caster = spell->GetCaster();
         Player* player = caster ? caster->ToPlayer() : nullptr;
         if (!player || player->GetSession()->IsBot())
             return;
