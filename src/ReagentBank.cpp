@@ -309,7 +309,7 @@ public:
         // GetCaster() returns WorldObject* since the core refactor; ToPlayer() works on it
         WorldObject* caster = spell->GetCaster();
         Player* player = caster ? caster->ToPlayer() : nullptr;
-        if (!player || player->GetSession()->IsBot())
+        if (!player || player->GetSession()->IsHeadless())
             return;
 
         uint32 accountId = player->GetSession()->GetAccountId();
